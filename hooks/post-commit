@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+export PATH="$HOME/.local/bin:$PATH"
+
+REPO="${REPO:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
+SHA="${SHA:-$(git rev-parse HEAD 2>/dev/null)}"
+KODGARD_HOME="${KODGARD_HOME:-$(cd "$(dirname "$0")/.." && pwd)}"
+
+unset $(git rev-parse --local-env-vars 2>/dev/null)
+
+if [ -n "$REPO" ] && [ -n "$SHA" ]; then
+    (cd "$KODGARD_HOME" && uv run python -m app.cli enqueue --repo "$REPO" --sha "$SHA") >/dev/null 2>&1 &
+fi
+
+exit 0
