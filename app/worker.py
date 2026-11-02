@@ -1,4 +1,5 @@
 import logging
+import subprocess
 from typing import Any
 
 from app import db, reviewer, scanner
@@ -56,6 +57,7 @@ def process_one_scan() -> dict[str, Any] | None:
             new_findings=all_findings,
         )
         db.complete_scan(scan_id)
+        print(f"scan_id={scan_id} sha={sha[:8]} done")
         logger.info(
             "Completed scan_id=%d sha=%s findings=%d",
             scan_id,
@@ -68,6 +70,16 @@ def process_one_scan() -> dict[str, Any] | None:
             "sha": sha,
             "status": "done",
             "findings_count": len(saved_findings),
+        }
+    except subprocess.CalledProcessError:
+        db.fail_scan(scan_id, "commit_not_found")
+        print(f"scan_id={scan_id} sha={sha[:8]} skipped: commit_not_found")
+        return {
+            "scan_id": scan_id,
+            "commit_id": commit_id,
+            "sha": sha,
+            "status": "failed",
+            "error": "commit_not_found",
         }
     except Exception as exc:
         err_class = type(exc).__name__
