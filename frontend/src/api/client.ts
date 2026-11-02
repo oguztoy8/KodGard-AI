@@ -49,6 +49,25 @@ export interface HealthResponse {
   db: string;
 }
 
+export interface AssistantStatusResponse {
+  indexed_commits: number;
+  total_commits: number;
+  chunks: number;
+}
+
+export interface AssistantSourceItem {
+  n: number;
+  sha8: string;
+  kind: string;
+  ref: string;
+  snippet: string;
+}
+
+export interface ChatHistoryMessage {
+  role: "user" | "assistant";
+  content: string;
+}
+
 export async function fetchHealth(): Promise<HealthResponse> {
   const res = await fetch(`${API_URL}/health`);
   if (!res.ok) {
@@ -101,6 +120,14 @@ export async function patchFindingStatus(
   if (!res.ok) {
     const errData = await res.json().catch(() => ({}));
     throw new Error(errData.detail || `Failed to update finding (${res.status})`);
+  }
+  return res.json();
+}
+
+export async function fetchAssistantStatus(): Promise<AssistantStatusResponse> {
+  const res = await fetch(`${API_URL}/assistant/status`);
+  if (!res.ok) {
+    throw new Error(`Failed to fetch assistant status (${res.status})`);
   }
   return res.json();
 }

@@ -3,9 +3,10 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from app import db
+from app import assistant, db
 from app.findings import VALID_STATUSES
 
 
@@ -120,3 +121,20 @@ def patch_finding(finding_id: int, payload: FindingStatusPatch) -> dict[str, Any
     if updated is None:
         raise HTTPException(status_code=404, detail="Finding not found")
     return updated
+
+
+@app.get("/assistant/status")
+def assistant_status() -> dict[str, int]:
+    return db.get_assistant_status()
+
+
+@app.post("/assistant/chat")
+async def assistant_chat(payload: assistant.ChatRequest) -> StreamingResponse:
+    return StreamingResponse(
+        assistant.stream_assistant_chat(payload),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )

@@ -1,8 +1,9 @@
 import { useState } from "react";
 import { CommitList } from "./pages/CommitList";
 import { Health } from "./pages/Health";
+import { Assistant } from "./pages/Assistant";
 
-type Tab = "commits" | "health";
+type Tab = "commits" | "health" | "assistant";
 
 export function App() {
   const [activeTab, setActiveTab] = useState<Tab>("commits");
@@ -80,12 +81,33 @@ export function App() {
             >
               Sağlık
             </button>
+            <button
+              onClick={() => setActiveTab("assistant")}
+              style={{
+                padding: "6px 14px",
+                borderRadius: "6px",
+                border:
+                  activeTab === "assistant"
+                    ? "1px solid rgba(94, 106, 210, 0.5)"
+                    : "1px solid transparent",
+                backgroundColor:
+                  activeTab === "assistant" ? "rgba(94, 106, 210, 0.16)" : "transparent",
+                color: activeTab === "assistant" ? "#f7f8f8" : "#8a8f98",
+                fontSize: "13px",
+                fontWeight: 500,
+                cursor: "pointer",
+              }}
+            >
+              Asistan
+            </button>
           </nav>
         </div>
       </header>
 
       <main style={{ maxWidth: "1040px", margin: "0 auto", padding: "24px" }}>
-        {activeTab === "commits" ? <CommitList /> : <Health />}
+        {activeTab === "commits" && <CommitList />}
+        {activeTab === "health" && <Health />}
+        {activeTab === "assistant" && <Assistant />}
       </main>
     </div>
   );

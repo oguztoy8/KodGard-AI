@@ -56,6 +56,7 @@ def test_worker_marks_commit_not_found_and_continues_to_next_scan(
         patch("app.worker.db.save_commit_findings", return_value=[]) as mock_save_findings,
         patch("app.worker.db.complete_scan") as mock_complete,
         patch("app.worker.db.fail_scan") as mock_fail,
+        patch("app.worker.indexer.index_commit", return_value={"total": 0}),
     ):
         rc = worker.run_worker()
 

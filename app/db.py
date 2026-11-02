@@ -1,4 +1,5 @@
 import atexit
+import logging
 from pathlib import Path
 import sys
 from typing import Any, Mapping
@@ -7,6 +8,8 @@ from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
 from app.config import settings
+
+logger = logging.getLogger(__name__)
 
 _pool: ConnectionPool | None = None
 
@@ -618,7 +621,12 @@ def save_commit_findings(
             fixed_ids = determine_fixed_finding_ids(
                 earlier_open, list(dedup_by_fp.values()), changed_files
             )
+            affected_fixed_commits: set[int] = set()
             if fixed_ids:
+                fixed_id_set = set(fixed_ids)
+                for ef in earlier_open:
+                    if ef.get("id") in fixed_id_set and ef.get("commit_id") is not None:
+                        affected_fixed_commits.add(int(ef["commit_id"]))
                 cur.execute(
                     """
                     UPDATE findings
@@ -628,6 +636,19 @@ def save_commit_findings(
                     (fixed_ids,),
                 )
         conn.commit()
+
+    if affected_fixed_commits:
+        from app import indexer
+
+        for fixed_cid in sorted(affected_fixed_commits):
+            try:
+                indexer.refresh_finding_chunks(fixed_cid)
+            except Exception as exc:
+                logger.warning(
+                    "refresh_finding_chunks failed for commit_id=%d with %s",
+                    fixed_cid,
+                    type(exc).__name__,
+                )
     return saved
 
 
@@ -666,7 +687,167 @@ def update_finding_status(
             )
             row = cur.fetchone()
         conn.commit()
-        return dict(row) if row else None
+
+    if not row:
+        return None
+
+    result = dict(row)
+    try:
+        from app import indexer
+
+        indexer.refresh_finding_chunks(int(result["commit_id"]))
+    except Exception as exc:
+        logger.warning(
+            "refresh_finding_chunks failed for commit_id=%s with %s",
+            result.get("commit_id"),
+            type(exc).__name__,
+        )
+    return result
+
+
+def enqueue_scan_if_missing(commit_id: int) -> tuple[int, bool]:
+    """
+    Create a pending scan record for `commit_id` only if no scan record exists yet.
+    Returns (scan_id, created_new).
+    """
+    pool = get_pool()
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id FROM scans
+                WHERE commit_id = %s
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (commit_id,),
+            )
+            existing = cur.fetchone()
+            if existing:
+                conn.commit()
+                return int(existing["id"]), False
+
+            cur.execute(
+                """
+                INSERT INTO scans (commit_id, status)
+                VALUES (%s, 'pending')
+                RETURNING id
+                """,
+                (commit_id,),
+            )
+            row = cur.fetchone()
+            conn.commit()
+            return int(row["id"]), True
+
+
+def list_done_commits(sha: str | None = None) -> list[dict[str, Any]]:
+    """
+    List commits for reindexing:
+    - If `sha` is provided, return matching commit(s) by full or prefix SHA.
+    - If `sha` is None, return all commits whose latest scan status is 'done'.
+    """
+    pool = get_pool()
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            if sha:
+                cur.execute(
+                    """
+                    SELECT c.id, c.sha, c.repo_path, c.subject
+                    FROM commits c
+                    WHERE c.sha = %s OR c.sha LIKE %s
+                    ORDER BY c.id ASC
+                    """,
+                    (sha, f"{sha}%"),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT c.id, c.sha, c.repo_path, c.subject
+                    FROM commits c
+                    JOIN LATERAL (
+                        SELECT status
+                        FROM scans
+                        WHERE scans.commit_id = c.id
+                        ORDER BY id DESC
+                        LIMIT 1
+                    ) s ON true
+                    WHERE s.status = 'done'
+                    ORDER BY c.id ASC
+                    """
+                )
+            return [dict(r) for r in cur.fetchall()]
+
+
+def search_chunks_by_vector(
+    query_vector: list[float],
+    commit_sha: str | None = None,
+    limit: int = 5,
+) -> list[dict[str, Any]]:
+    """Retrieve top-K chunks ordered by cosine distance (`embedding <=> query_vector`)."""
+    vec_literal = "[" + ",".join(f"{float(x):.8f}" for x in query_vector) + "]"
+    pool = get_pool()
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            if commit_sha and commit_sha.strip():
+                sha_val = commit_sha.strip()
+                cur.execute(
+                    """
+                    SELECT
+                        ch.id,
+                        ch.commit_id,
+                        c.sha,
+                        ch.kind,
+                        ch.source_ref,
+                        ch.content,
+                        (ch.embedding <=> %s::vector) AS distance
+                    FROM chunks ch
+                    JOIN commits c ON c.id = ch.commit_id
+                    WHERE c.sha = %s OR c.sha LIKE %s
+                    ORDER BY ch.embedding <=> %s::vector ASC, ch.id ASC
+                    LIMIT %s
+                    """,
+                    (vec_literal, sha_val, f"{sha_val}%", vec_literal, limit),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT
+                        ch.id,
+                        ch.commit_id,
+                        c.sha,
+                        ch.kind,
+                        ch.source_ref,
+                        ch.content,
+                        (ch.embedding <=> %s::vector) AS distance
+                    FROM chunks ch
+                    JOIN commits c ON c.id = ch.commit_id
+                    ORDER BY ch.embedding <=> %s::vector ASC, ch.id ASC
+                    LIMIT %s
+                    """,
+                    (vec_literal, vec_literal, limit),
+                )
+            return [dict(r) for r in cur.fetchall()]
+
+
+def get_assistant_status() -> dict[str, int]:
+    """Return counts of indexed commits, total commits, and total chunks."""
+    pool = get_pool()
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    (SELECT COUNT(*) FROM commits WHERE indexed_at IS NOT NULL) AS indexed_commits,
+                    (SELECT COUNT(*) FROM commits) AS total_commits,
+                    (SELECT COUNT(*) FROM chunks) AS chunks
+                """
+            )
+            row = cur.fetchone() or {}
+            return {
+                "indexed_commits": int(row.get("indexed_commits") or 0),
+                "total_commits": int(row.get("total_commits") or 0),
+                "chunks": int(row.get("chunks") or 0),
+            }
 
 
 def main(argv: list[str] | None = None) -> int:
