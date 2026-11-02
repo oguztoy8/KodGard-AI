@@ -3,7 +3,7 @@ import logging
 import sys
 from pathlib import Path
 
-from app import db, git_reader
+from app import db, git_reader, worker
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -36,6 +36,10 @@ def cmd_list(repo: str | None, limit: int) -> int:
     return 0
 
 
+def cmd_worker() -> int:
+    return worker.run_worker()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="kodgard", description="KodGard AI CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -48,6 +52,8 @@ def build_parser() -> argparse.ArgumentParser:
     list_parser.add_argument("--repo", required=False, default=None, help="Filter by repository path")
     list_parser.add_argument("--limit", type=int, default=20, help="Maximum commits to list")
 
+    subparsers.add_parser("worker", help="Process pending scans sequentially")
+
     return parser
 
 
@@ -59,6 +65,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_enqueue(args.repo, args.sha)
         if args.command == "list":
             return cmd_list(args.repo, args.limit)
+        if args.command == "worker":
+            return cmd_worker()
         return 1
     finally:
         db.close_pool()

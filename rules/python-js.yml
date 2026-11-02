@@ -1,0 +1,116 @@
+rules:
+  - id: kodgard-eval-usage-python
+    languages:
+      - python
+    message: "Dinamik kod çalıştırma (eval/exec) kullanımı tespit edildi. Güvenilmeyen girdilerle uzaktan kod çalıştırma (RCE) zafiyetine yol açabilir."
+    severity: ERROR
+    metadata:
+      cwe: "CWE-95"
+      title: "Tehlikeli eval() / exec() kullanımı"
+      fix: "eval() yerine ast.literal_eval veya json.loads gibi güvenli ayrıştırıcılar kullanın."
+    pattern-either:
+      - pattern: eval(...)
+      - pattern: exec(...)
+
+  - id: kodgard-eval-usage-js
+    languages:
+      - javascript
+    message: "Dinamik kod çalıştırma (eval) kullanımı tespit edildi. Güvenilmeyen girdilerle uzaktan kod çalıştırma (RCE) zafiyetine yol açabilir."
+    severity: ERROR
+    metadata:
+      cwe: "CWE-95"
+      title: "Tehlikeli eval() kullanımı"
+      fix: "eval() yerine JSON.parse gibi güvenli ayrıştırıcılar kullanın."
+    pattern-either:
+      - pattern: eval(...)
+      - pattern: new Function(...)
+
+  - id: kodgard-subprocess-shell-true
+    languages:
+      - python
+    message: "subprocess çağrısında shell=True kullanımı işletim sistemi komut enjeksiyonuna yol açabilir."
+    severity: ERROR
+    metadata:
+      cwe: "CWE-78"
+      title: "subprocess ile shell=True kullanımı"
+      fix: "shell=False kullanın ve komut argümanlarını liste olarak geçirin."
+    pattern-either:
+      - pattern: subprocess.$FUNC(..., shell=True, ...)
+      - pattern: os.system(...)
+      - pattern: os.popen(...)
+
+  - id: kodgard-hardcoded-password-python
+    languages:
+      - python
+    message: "Kod içinde sabit yazılmış (hardcoded) parola veya gizli anahtar tespit edildi."
+    severity: WARNING
+    metadata:
+      cwe: "CWE-798"
+      title: "Sabit kodlanmış parola veya sır"
+      fix: "Parola ve anahtarları kaynak koddan kaldırıp ortam değişkenlerinden (os.environ) okuyun."
+    patterns:
+      - pattern: $VAR = "..."
+      - metavariable-regex:
+          metavariable: $VAR
+          regex: (?i).*(password|passwd|pwd|secret|api_key|apikey|access_key|auth_token|aws_access_key_id|aws_secret_access_key|token).*
+
+  - id: kodgard-hardcoded-password-js
+    languages:
+      - javascript
+    message: "Kod içinde sabit yazılmış (hardcoded) parola veya gizli anahtar tespit edildi."
+    severity: WARNING
+    metadata:
+      cwe: "CWE-798"
+      title: "Sabit kodlanmış parola veya sır"
+      fix: "Parola ve anahtarları kaynak koddan kaldırıp ortam değişkenlerinden (process.env) okuyun."
+    patterns:
+      - pattern: $VAR = "..."
+      - metavariable-regex:
+          metavariable: $VAR
+          regex: (?i).*(password|passwd|pwd|secret|api_key|apikey|access_key|auth_token|aws_access_key_id|aws_secret_access_key|token).*
+
+  - id: kodgard-sql-string-concat-python
+    languages:
+      - python
+    message: "SQL sorgusunda doğrudan string birleştirme veya biçimlendirme kullanımı SQL Injection zafiyetine yol açabilir."
+    severity: ERROR
+    metadata:
+      cwe: "CWE-89"
+      title: "SQL sorgusunda string birleştirme (SQL Injection riski)"
+      fix: "Sorgularda string birleştirme yerine parametreli sorgular (prepared statements) kullanın."
+    pattern-either:
+      - pattern: $CUR.execute("..." + ...)
+      - pattern: $CUR.execute("..." + ..., ...)
+      - pattern: $CUR.execute(f"...")
+      - pattern: $CUR.execute(f"...", ...)
+      - pattern: $CUR.execute("..." % ...)
+      - pattern: $CUR.execute("...".format(...))
+
+  - id: kodgard-sql-string-concat-js
+    languages:
+      - javascript
+    message: "SQL sorgusunda doğrudan string birleştirme kullanımı SQL Injection zafiyetine yol açabilir."
+    severity: ERROR
+    metadata:
+      cwe: "CWE-89"
+      title: "SQL sorgusunda string birleştirme (SQL Injection riski)"
+      fix: "Sorgularda string birleştirme yerine parametreli sorgular (prepared statements) kullanın."
+    pattern-either:
+      - pattern: $DB.query("..." + ...)
+      - pattern: $DB.query("..." + ..., ...)
+      - pattern: $DB.execute("..." + ...)
+      - pattern: $DB.execute("..." + ..., ...)
+
+  - id: kodgard-innerhtml-assignment
+    languages:
+      - javascript
+    message: "innerHTML veya outerHTML'e doğrudan atama yapılması Cross-Site Scripting (XSS) zafiyetine yol açabilir."
+    severity: WARNING
+    metadata:
+      cwe: "CWE-79"
+      title: "Güvensiz innerHTML kullanımı (XSS riski)"
+      fix: "Metin içeriği için textContent kullanın veya HTML içeriğini DOMPurify ile temizleyin."
+    pattern-either:
+      - pattern: $EL.innerHTML = $VAL
+      - pattern: $EL.outerHTML = $VAL
+      - pattern: document.write(...)

@@ -1,10 +1,17 @@
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 from app import db
+from app.findings import VALID_STATUSES
+
+
+class FindingStatusPatch(BaseModel):
+    status: str
+    ignore_reason: str | None = None
 
 
 @asynccontextmanager
@@ -56,3 +63,60 @@ def get_commit_detail(sha: str) -> dict[str, Any]:
     if commit is None:
         raise HTTPException(status_code=404, detail="Commit not found")
     return commit
+
+
+@app.get("/commits/{sha}/docs")
+def get_commit_docs(sha: str) -> dict[str, str]:
+    docs = db.get_docs_by_sha(sha)
+    if docs is None:
+        raise HTTPException(status_code=404, detail="Commit not found")
+    return {
+        "summary": docs.get("summary") or "",
+        "detail": docs.get("detail") or "",
+    }
+
+
+@app.get("/commits/{sha}/export")
+def export_commit_doc(
+    sha: str,
+    doc: str = Query(..., description="Document kind: summary or detail"),
+) -> Response:
+    if doc not in ("summary", "detail"):
+        raise HTTPException(status_code=400, detail="doc must be 'summary' or 'detail'")
+    docs = db.get_docs_by_sha(sha)
+    if docs is None:
+        raise HTTPException(status_code=404, detail="Commit not found")
+    body_md = docs.get(doc) or ""
+    sha8 = str(docs.get("sha") or sha)[:8]
+    filename = f"{sha8}-{doc}.md"
+    return Response(
+        content=body_md,
+        media_type="text/markdown; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+        },
+    )
+
+
+@app.patch("/findings/{finding_id}")
+def patch_finding(finding_id: int, payload: FindingStatusPatch) -> dict[str, Any]:
+    status_val = (payload.status or "").strip()
+    if status_val not in VALID_STATUSES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid status '{status_val}'. Allowed: {sorted(VALID_STATUSES)}",
+        )
+    reason_val = (payload.ignore_reason or "").strip() if payload.ignore_reason else None
+    if status_val == "ignored" and not reason_val:
+        raise HTTPException(
+            status_code=400,
+            detail="ignore_reason is required when status is 'ignored'",
+        )
+    updated = db.update_finding_status(
+        finding_id=finding_id,
+        status=status_val,
+        ignore_reason=reason_val,
+    )
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Finding not found")
+    return updated

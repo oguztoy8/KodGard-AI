@@ -302,7 +302,7 @@ def list_commits_with_status(
 
 
 def get_commit_by_sha(sha: str) -> dict[str, Any] | None:
-    """Fetch a single commit by full or prefix SHA, including scan status and findings=[]."""
+    """Fetch a single commit by full or prefix SHA, including scan status and findings."""
     pool = get_pool()
     with pool.connection() as conn:
         with conn.cursor() as cur:
@@ -340,8 +340,333 @@ def get_commit_by_sha(sha: str) -> dict[str, Any] | None:
             if not row:
                 return None
             result = dict(row)
-            result["findings"] = []
+            commit_id = int(result["id"])
+            cur.execute(
+                """
+                SELECT
+                    id,
+                    commit_id,
+                    source,
+                    rule_id,
+                    severity,
+                    file,
+                    line,
+                    cwe,
+                    title,
+                    explanation,
+                    fix,
+                    status,
+                    ignore_reason,
+                    fingerprint,
+                    created_at
+                FROM findings
+                WHERE commit_id = %s
+                ORDER BY
+                    CASE severity
+                        WHEN 'critical' THEN 1
+                        WHEN 'high' THEN 2
+                        WHEN 'medium' THEN 3
+                        WHEN 'low' THEN 4
+                        ELSE 5
+                    END,
+                    id ASC
+                """,
+                (commit_id,),
+            )
+            result["findings"] = [dict(r) for r in cur.fetchall()]
             return result
+
+
+def claim_next_pending_scan() -> dict[str, Any] | None:
+    """
+    Claim a single pending scan row using `SELECT ... FOR UPDATE SKIP LOCKED`
+    and immediately transition its status to 'running'.
+    """
+    pool = get_pool()
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    s.id AS scan_id,
+                    s.commit_id,
+                    c.sha,
+                    c.patch_id,
+                    c.author,
+                    c.committed_at,
+                    c.subject,
+                    c.repo_path
+                FROM scans s
+                JOIN commits c ON c.id = s.commit_id
+                WHERE s.status = 'pending'
+                ORDER BY s.id ASC
+                FOR UPDATE OF s SKIP LOCKED
+                LIMIT 1
+                """
+            )
+            row = cur.fetchone()
+            if not row:
+                conn.commit()
+                return None
+            scan_id = int(row["scan_id"])
+            cur.execute(
+                """
+                UPDATE scans
+                SET status = 'running',
+                    error = NULL,
+                    started_at = now(),
+                    finished_at = NULL
+                WHERE id = %s
+                """,
+                (scan_id,),
+            )
+            conn.commit()
+            return dict(row)
+
+
+def complete_scan(scan_id: int) -> None:
+    pool = get_pool()
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE scans
+                SET status = 'done',
+                    error = NULL,
+                    finished_at = now()
+                WHERE id = %s
+                """,
+                (scan_id,),
+            )
+        conn.commit()
+
+
+def fail_scan(scan_id: int, error_class_name: str) -> None:
+    pool = get_pool()
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE scans
+                SET status = 'failed',
+                    error = %s,
+                    finished_at = now()
+                WHERE id = %s
+                """,
+                (error_class_name, scan_id),
+            )
+        conn.commit()
+
+
+def upsert_doc(commit_id: int, kind: str, body_md: str, model: str) -> int:
+    pool = get_pool()
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO docs (commit_id, kind, body_md, model)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (commit_id, kind) DO UPDATE
+                SET body_md = EXCLUDED.body_md,
+                    model = EXCLUDED.model,
+                    created_at = now()
+                RETURNING id
+                """,
+                (commit_id, kind, body_md, model),
+            )
+            row = cur.fetchone()
+        conn.commit()
+        return int(row["id"])
+
+
+def get_docs_by_sha(sha: str) -> dict[str, Any] | None:
+    pool = get_pool()
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, sha
+                FROM commits
+                WHERE sha = %s OR sha LIKE %s
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (sha, f"{sha}%"),
+            )
+            commit_row = cur.fetchone()
+            if not commit_row:
+                return None
+            commit_id = int(commit_row["id"])
+            full_sha = str(commit_row["sha"])
+            cur.execute(
+                """
+                SELECT kind, body_md, model, created_at
+                FROM docs
+                WHERE commit_id = %s
+                """,
+                (commit_id,),
+            )
+            docs_rows = cur.fetchall()
+            out: dict[str, Any] = {
+                "sha": full_sha,
+                "summary": "",
+                "detail": "",
+            }
+            for r in docs_rows:
+                kind = r["kind"]
+                if kind in ("summary", "detail"):
+                    out[kind] = r["body_md"]
+            return out
+
+
+def save_commit_findings(
+    commit_id: int,
+    repo_path: str,
+    changed_files: list[str],
+    new_findings: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """
+    Save findings for `commit_id` while:
+    1. Preserving 'ignored' status & ignore_reason if the same fingerprint was ever marked ignored in this repo.
+    2. Marking earlier 'open' findings on `changed_files` in the same repo as 'fixed' if their fingerprint did not recur.
+    """
+    from app.findings import apply_ignored_preservation, determine_fixed_finding_ids
+
+    resolved_repo = str(Path(repo_path).resolve())
+    pool = get_pool()
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    f.id,
+                    f.commit_id,
+                    f.file,
+                    f.status,
+                    f.ignore_reason,
+                    f.fingerprint
+                FROM findings f
+                JOIN commits c ON c.id = f.commit_id
+                WHERE c.repo_path = %s
+                ORDER BY f.id ASC
+                """,
+                (resolved_repo,),
+            )
+            existing_repo_findings = [dict(r) for r in cur.fetchall()]
+
+            prepared = apply_ignored_preservation(new_findings, existing_repo_findings)
+
+            # Upsert unique by fingerprint (deduplicate in-memory first if needed)
+            dedup_by_fp: dict[str, dict[str, Any]] = {}
+            for item in prepared:
+                dedup_by_fp[item["fingerprint"]] = item
+
+            saved: list[dict[str, Any]] = []
+            for item in dedup_by_fp.values():
+                cur.execute(
+                    """
+                    INSERT INTO findings (
+                        commit_id, source, rule_id, severity, file, line,
+                        cwe, title, explanation, fix, status, ignore_reason, fingerprint
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (commit_id, fingerprint) DO UPDATE
+                    SET source = EXCLUDED.source,
+                        rule_id = EXCLUDED.rule_id,
+                        severity = EXCLUDED.severity,
+                        file = EXCLUDED.file,
+                        line = EXCLUDED.line,
+                        cwe = EXCLUDED.cwe,
+                        title = EXCLUDED.title,
+                        explanation = EXCLUDED.explanation,
+                        fix = EXCLUDED.fix,
+                        status = CASE
+                            WHEN findings.status = 'ignored' THEN 'ignored'
+                            ELSE EXCLUDED.status
+                        END,
+                        ignore_reason = CASE
+                            WHEN findings.status = 'ignored' THEN findings.ignore_reason
+                            ELSE EXCLUDED.ignore_reason
+                        END
+                    RETURNING *
+                    """,
+                    (
+                        commit_id,
+                        item.get("source"),
+                        item.get("rule_id"),
+                        item.get("severity"),
+                        item.get("file"),
+                        item.get("line"),
+                        item.get("cwe"),
+                        item.get("title"),
+                        item.get("explanation"),
+                        item.get("fix"),
+                        item.get("status", "open"),
+                        item.get("ignore_reason"),
+                        item["fingerprint"],
+                    ),
+                )
+                row = cur.fetchone()
+                if row:
+                    saved.append(dict(row))
+
+            earlier_open = [
+                ef
+                for ef in existing_repo_findings
+                if int(ef["commit_id"]) != int(commit_id) and ef.get("status") == "open"
+            ]
+            fixed_ids = determine_fixed_finding_ids(
+                earlier_open, list(dedup_by_fp.values()), changed_files
+            )
+            if fixed_ids:
+                cur.execute(
+                    """
+                    UPDATE findings
+                    SET status = 'fixed'
+                    WHERE id = ANY(%s)
+                    """,
+                    (fixed_ids,),
+                )
+        conn.commit()
+    return saved
+
+
+def update_finding_status(
+    finding_id: int,
+    status: str,
+    ignore_reason: str | None = None,
+) -> dict[str, Any] | None:
+    pool = get_pool()
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE findings
+                SET status = %s,
+                    ignore_reason = %s
+                WHERE id = %s
+                RETURNING
+                    id,
+                    commit_id,
+                    source,
+                    rule_id,
+                    severity,
+                    file,
+                    line,
+                    cwe,
+                    title,
+                    explanation,
+                    fix,
+                    status,
+                    ignore_reason,
+                    fingerprint,
+                    created_at
+                """,
+                (status, ignore_reason if status == "ignored" else None, finding_id),
+            )
+            row = cur.fetchone()
+        conn.commit()
+        return dict(row) if row else None
 
 
 def main(argv: list[str] | None = None) -> int:
