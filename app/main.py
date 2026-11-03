@@ -3,10 +3,10 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
-from app import assistant, db
+from app import assistant, db, enqueue
 from app.findings import VALID_STATUSES
 
 
@@ -138,3 +138,25 @@ async def assistant_chat(payload: assistant.ChatRequest) -> StreamingResponse:
             "X-Accel-Buffering": "no",
         },
     )
+
+
+# Not: /enqueue endpoint'inde kimlik doğrulaması yoktur.
+# Servis varsayılan olarak yalnızca yerel arayüze (127.0.0.1) bağlıdır.
+@app.post("/enqueue")
+def post_enqueue(
+    repo: str = Query(..., description="Host repository path"),
+    sha: str = Query(..., description="Commit SHA (7-40 hex chars)"),
+) -> JSONResponse:
+    try:
+        result = enqueue.enqueue_commit(repo=repo, sha=sha)
+    except enqueue.RepoNotAllowedError:
+        return JSONResponse(status_code=400, content={"error": "repo_not_allowed"})
+    except enqueue.InvalidShaError as exc:
+        return JSONResponse(status_code=400, content={"error": exc.code})
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "enqueue_failed"})
+
+    if result.get("status") == "skipped_merge":
+        return JSONResponse(status_code=200, content={"status": "skipped_merge"})
+
+    return JSONResponse(status_code=202, content={"scan_id": int(result["scan_id"])})

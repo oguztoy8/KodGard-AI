@@ -3,7 +3,7 @@ import logging
 from pathlib import Path
 import sys
 
-from app import db, git_reader, indexer, worker
+from app import db, enqueue, git_reader, indexer, worker
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -20,14 +20,18 @@ class _MergeLogCounter(logging.Handler):
 
 
 def cmd_enqueue(repo: str, sha: str) -> int:
-    repo_path = str(Path(repo).resolve())
-    commit = git_reader.get_commit(repo_path, sha)
-    if commit is None:
-        logger.info("Commit %s skipped (merge commit or not found)", sha)
+    res = enqueue.enqueue_commit(repo, sha)
+    if res["status"] == "skipped_merge":
+        logger.info("Commit %s skipped (merge commit)", res["sha"])
         return 0
-    commit_id = db.upsert_commit(commit, repo_path)
-    scan_id = db.enqueue_scan(commit_id)
-    print(f"Enqueued commit_id={commit_id} scan_id={scan_id} sha={commit['sha']}")
+    print(f"Enqueued commit_id={res['commit_id']} scan_id={res['scan_id']} sha={res['sha']}")
+    return 0
+
+
+def cmd_download_model() -> int:
+    emb = indexer.get_embedder()
+    vec = emb.embed_query("kodgard model init")
+    print(f"dim={len(vec)}", flush=True)
     return 0
 
 
@@ -135,6 +139,8 @@ def build_parser() -> argparse.ArgumentParser:
     backfill_parser.add_argument("--limit", type=int, default=20, help="Number of commits (1..200)")
     backfill_parser.add_argument("--yes", action="store_true", help="Confirm when limit > 20")
 
+    subparsers.add_parser("download-model", help="Download and verify local embedding model")
+
     return parser
 
 
@@ -152,6 +158,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_reindex(sha=args.sha, reindex_all=args.reindex_all)
         if args.command == "backfill":
             return cmd_backfill(repo=args.repo, limit=args.limit, yes=args.yes)
+        if args.command == "download-model":
+            return cmd_download_model()
         return 1
     finally:
         db.close_pool()

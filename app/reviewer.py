@@ -7,11 +7,12 @@ import anthropic
 from anthropic.lib._parse._transform import to_json_output_format
 from pydantic import BaseModel, Field
 
+from app.config import settings
 from app.findings import compute_fingerprint
 
 logger = logging.getLogger(__name__)
 
-MODEL_NAME = "claude-sonnet-5-5"
+MODEL_NAME = settings.REVIEW_MODEL
 MAX_TOKENS = 4096
 TEMPERATURE = 0
 

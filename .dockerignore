@@ -1,0 +1,17 @@
+.env
+.env.*
+.git
+node_modules
+.venv
+graphify-out
+__pycache__
+*.pyc
+.pytest_cache
+.ruff_cache
+frontend/node_modules
+frontend/dist
+frontend/.env
+frontend/.env.*
+docs/screenshots
+.playwright-cli
+.playwright

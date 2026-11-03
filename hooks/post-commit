@@ -8,7 +8,21 @@ KODGARD_HOME="${KODGARD_HOME:-$(cd "$(dirname "$0")/.." && pwd)}"
 unset $(git rev-parse --local-env-vars 2>/dev/null)
 
 if [ -n "$REPO" ] && [ -n "$SHA" ]; then
-    (cd "$KODGARD_HOME" && uv run python -m app.cli enqueue --repo "$REPO" --sha "$SHA") >/dev/null 2>&1 &
+    if [ -n "${KODGARD_API_URL:-}" ]; then
+        (
+            HTTP_CODE="$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 1 -m 3 -X POST -G --data-urlencode "repo=$REPO" --data-urlencode "sha=$SHA" "${KODGARD_API_URL%/}/enqueue" 2>/dev/null || true)"
+            case "$HTTP_CODE" in
+                2[0-9][0-9]) ;;
+                *)
+                    LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/kodgard"
+                    mkdir -p "$LOG_DIR" 2>/dev/null || true
+                    printf '%s http_code=%s\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "${HTTP_CODE:-000}" >> "$LOG_DIR/hook.log" 2>/dev/null || true
+                    ;;
+            esac
+        ) </dev/null >/dev/null 2>&1 &
+    else
+        (cd "$KODGARD_HOME" && uv run python -m app.cli enqueue --repo "$REPO" --sha "$SHA") </dev/null >/dev/null 2>&1 &
+    fi
 fi
 
 exit 0

@@ -9,7 +9,7 @@ Tüm servisler (PostgreSQL, FastAPI/Uvicorn ve Vite geliştirme sunucusu) yalnı
 ### 1. Veritabanı (PostgreSQL)
 
 ```bash
-docker compose up -d
+docker compose up -d db
 uv run python -m app.db migrate
 ```
 
