@@ -2,6 +2,7 @@ from collections.abc import AsyncIterator
 import json
 import logging
 import os
+import re
 from typing import Any, Literal
 
 import anthropic
@@ -16,6 +17,28 @@ logger = logging.getLogger(__name__)
 ASSISTANT_MAX_TOKENS = 1024
 ASSISTANT_TEMPERATURE = 0
 MAX_HISTORY_MESSAGES = 6
+MAX_CHUNK_CONTEXT_CHARS = 1500
+FINDING_HYBRID_LIMIT = 4
+
+SHA_CANDIDATE_RE = re.compile(r"\b[0-9a-fA-F]{7,40}\b")
+
+SECURITY_INTENT_ROOTS: tuple[str, ...] = (
+    "güvenlik",
+    "guvenlik",
+    "açık",
+    "acik",
+    "zafiyet",
+    "vulnerab",
+    "security",
+    "cwe",
+    "sır",
+    "secret",
+    "bulgu",
+    "finding",
+    "risk",
+    "injection",
+    "leak",
+)
 
 ASSISTANT_SYSTEM_PROMPT = (
     "Sen KodGard AI güvenlik ve kod analizi asistanısın.\n"
@@ -27,6 +50,8 @@ ASSISTANT_SYSTEM_PROMPT = (
     "- Yalnızca <context> içindeki bilgilere dayanarak soruyu cevapla. Eğer sorunun cevabı bağlamda yoksa "
     "'indexlenmiş içerikte bulamadım' de.\n"
     "- Cevabında kullandığın kaynakları [1], [2] biçiminde numaralarıyla an.\n"
+    "- Bulgu chunk'larında 'Status: fixed' yazıyorsa o bulgunun sonradan düzeltildiğini, "
+    "'Status: ignored' (veya 'ignored') yazıyorsa kullanıcının kabul ettiğini cevapta belirt.\n"
     "- Hiçbir zaman gerçek veya sahte sır, API anahtarı ya da parola değeri üretme veya tekrarlama.\n"
     "- Cevap dili: sorunun sorulduğu dil (Türkçe soruya Türkçe, İngilizce soruya İngilizce cevap ver)."
 )
@@ -48,14 +73,114 @@ def format_sse(event: str, data: Any) -> str:
     return f"event: {event}\ndata: {payload}\n\n"
 
 
+def extract_sha_candidates(question: str) -> list[str]:
+    """
+    Extract 7..40 hex tokens from `question` that contain at least one digit (0-9)
+    so ordinary hex-letter words (e.g. 'defaced') are ignored.
+    """
+    if not question:
+        return []
+    candidates: list[str] = []
+    for match in SHA_CANDIDATE_RE.findall(question):
+        if any(ch.isdigit() for ch in match):
+            lowered = match.lower()
+            if lowered not in candidates:
+                candidates.append(lowered)
+    return candidates
+
+
+def resolve_effective_commit_sha(
+    question: str,
+    explicit_commit_sha: str | None = None,
+) -> str | None:
+    """
+    Determine commit SHA filter:
+    - If `explicit_commit_sha` is provided, return it directly without auto-detection.
+    - Otherwise, inspect SHA candidates in `question`; if they resolve to a single unique
+      commit in `commits.sha`, return that SHA. On 0 or >1 matches, return None.
+    """
+    if explicit_commit_sha and explicit_commit_sha.strip():
+        return explicit_commit_sha.strip()
+
+    candidates = extract_sha_candidates(question)
+    if not candidates:
+        return None
+
+    resolved_shas: list[str] = []
+    for cand in candidates:
+        resolved = db.resolve_unique_commit_sha(cand)
+        if resolved and resolved not in resolved_shas:
+            resolved_shas.append(resolved)
+
+    if len(resolved_shas) == 1:
+        return resolved_shas[0]
+    return None
+
+
+def has_security_intent(question: str) -> bool:
+    """Return True if lowercased question contains any security intent root."""
+    if not question:
+        return False
+    q_std = question.lower()
+    q_tr = question.replace("İ", "i").replace("I", "ı").lower()
+    combined = f"{q_std} {q_tr}"
+    return any(root in combined for root in SECURITY_INTENT_ROOTS)
+
+
+def merge_hybrid_chunks(
+    finding_chunks: list[dict[str, Any]],
+    general_chunks: list[dict[str, Any]],
+    top_k: int = TOP_K_CHUNKS,
+) -> list[dict[str, Any]]:
+    """
+    Combine finding chunks first, then general chunks, deduplicating by chunk id
+    and capping total length at `top_k`.
+    """
+    merged: list[dict[str, Any]] = []
+    seen_keys: set[Any] = set()
+
+    def _chunk_key(ch: dict[str, Any]) -> Any:
+        cid = ch.get("id")
+        if cid is not None:
+            return ("id", cid)
+        return (
+            "fallback",
+            ch.get("sha"),
+            ch.get("kind"),
+            ch.get("source_ref"),
+            ch.get("content"),
+        )
+
+    for ch in finding_chunks:
+        key = _chunk_key(ch)
+        if key not in seen_keys:
+            seen_keys.add(key)
+            merged.append(ch)
+            if len(merged) >= top_k:
+                return merged
+
+    for ch in general_chunks:
+        key = _chunk_key(ch)
+        if key not in seen_keys:
+            seen_keys.add(key)
+            merged.append(ch)
+            if len(merged) >= top_k:
+                return merged
+
+    return merged
+
+
 def build_context_block(chunks: list[dict[str, Any]]) -> str:
-    """Wrap retrieved chunks inside <context> and <chunk n=... sha=... kind=... ref=...> tags."""
+    """
+    Wrap retrieved chunks inside <context> and <chunk n=... sha=... kind=... ref=...> tags.
+    Each chunk content is truncated to at most MAX_CHUNK_CONTEXT_CHARS (1500) characters.
+    """
     lines: list[str] = ["<context>"]
     for idx, ch in enumerate(chunks, start=1):
         sha8 = str(ch.get("sha") or "")[:8]
         kind = str(ch.get("kind") or "")
         ref = str(ch.get("source_ref") or "")
-        content = str(ch.get("content") or "")
+        content = str(ch.get("content") or "")[:MAX_CHUNK_CONTEXT_CHARS]
         lines.append(
             f'<chunk n="{idx}" sha="{sha8}" kind="{kind}" ref="{ref}">\n{content}\n</chunk>'
         )
@@ -110,11 +235,27 @@ def _embed_and_retrieve_sync(
     top_k: int = TOP_K_CHUNKS,
     embedder: Any | None = None,
 ) -> list[dict[str, Any]]:
+    effective_sha = resolve_effective_commit_sha(question, commit_sha)
     emb = embedder or indexer.get_embedder()
     q_vec = emb.embed_query(question)
+
+    if has_security_intent(question):
+        finding_chunks = db.search_chunks_by_vector(
+            query_vector=q_vec,
+            commit_sha=effective_sha,
+            limit=FINDING_HYBRID_LIMIT,
+            kind="finding",
+        )
+        general_chunks = db.search_chunks_by_vector(
+            query_vector=q_vec,
+            commit_sha=effective_sha,
+            limit=top_k,
+        )
+        return merge_hybrid_chunks(finding_chunks, general_chunks, top_k=top_k)
+
     return db.search_chunks_by_vector(
         query_vector=q_vec,
-        commit_sha=commit_sha,
+        commit_sha=effective_sha,
         limit=top_k,
     )
 

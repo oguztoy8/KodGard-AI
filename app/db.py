@@ -778,54 +778,75 @@ def list_done_commits(sha: str | None = None) -> list[dict[str, Any]]:
             return [dict(r) for r in cur.fetchall()]
 
 
-def search_chunks_by_vector(
-    query_vector: list[float],
-    commit_sha: str | None = None,
-    limit: int = 5,
-) -> list[dict[str, Any]]:
-    """Retrieve top-K chunks ordered by cosine distance (`embedding <=> query_vector`)."""
-    vec_literal = "[" + ",".join(f"{float(x):.8f}" for x in query_vector) + "]"
+def resolve_unique_commit_sha(prefix: str) -> str | None:
+    """
+    Resolve a hex SHA prefix (7..40 chars) against `commits.sha`.
+    Returns the full SHA only if it matches EXACTLY ONE commit; returns None on 0 or >1 matches.
+    """
+    cleaned = (prefix or "").strip().lower()
+    if not cleaned:
+        return None
     pool = get_pool()
     with pool.connection() as conn:
         with conn.cursor() as cur:
-            if commit_sha and commit_sha.strip():
-                sha_val = commit_sha.strip()
-                cur.execute(
-                    """
-                    SELECT
-                        ch.id,
-                        ch.commit_id,
-                        c.sha,
-                        ch.kind,
-                        ch.source_ref,
-                        ch.content,
-                        (ch.embedding <=> %s::vector) AS distance
-                    FROM chunks ch
-                    JOIN commits c ON c.id = ch.commit_id
-                    WHERE c.sha = %s OR c.sha LIKE %s
-                    ORDER BY ch.embedding <=> %s::vector ASC, ch.id ASC
-                    LIMIT %s
-                    """,
-                    (vec_literal, sha_val, f"{sha_val}%", vec_literal, limit),
-                )
-            else:
-                cur.execute(
-                    """
-                    SELECT
-                        ch.id,
-                        ch.commit_id,
-                        c.sha,
-                        ch.kind,
-                        ch.source_ref,
-                        ch.content,
-                        (ch.embedding <=> %s::vector) AS distance
-                    FROM chunks ch
-                    JOIN commits c ON c.id = ch.commit_id
-                    ORDER BY ch.embedding <=> %s::vector ASC, ch.id ASC
-                    LIMIT %s
-                    """,
-                    (vec_literal, vec_literal, limit),
-                )
+            cur.execute(
+                """
+                SELECT sha
+                FROM commits
+                WHERE sha = %s OR sha LIKE %s
+                ORDER BY id ASC
+                LIMIT 2
+                """,
+                (cleaned, f"{cleaned}%"),
+            )
+            rows = cur.fetchall()
+            if len(rows) == 1:
+                return str(rows[0]["sha"])
+            return None
+
+
+def search_chunks_by_vector(
+    query_vector: list[float],
+    commit_sha: str | None = None,
+    limit: int = 8,
+    kind: str | None = None,
+) -> list[dict[str, Any]]:
+    """Retrieve top-K chunks ordered by cosine distance (`embedding <=> query_vector`)."""
+    vec_literal = "[" + ",".join(f"{float(x):.8f}" for x in query_vector) + "]"
+    where_clauses: list[str] = []
+    where_params: list[Any] = []
+
+    if commit_sha and commit_sha.strip():
+        sha_val = commit_sha.strip().lower()
+        where_clauses.append("(c.sha = %s OR c.sha LIKE %s)")
+        where_params.extend([sha_val, f"{sha_val}%"])
+
+    if kind and kind.strip():
+        where_clauses.append("ch.kind = %s")
+        where_params.append(kind.strip())
+
+    where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+    query = f"""
+        SELECT
+            ch.id,
+            ch.commit_id,
+            c.sha,
+            ch.kind,
+            ch.source_ref,
+            ch.content,
+            (ch.embedding <=> %s::vector) AS distance
+        FROM chunks ch
+        JOIN commits c ON c.id = ch.commit_id
+        {where_sql}
+        ORDER BY ch.embedding <=> %s::vector ASC, ch.id ASC
+        LIMIT %s
+    """
+    params = tuple([vec_literal, *where_params, vec_literal, limit])
+
+    pool = get_pool()
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(query, params)
             return [dict(r) for r in cur.fetchall()]
 
 

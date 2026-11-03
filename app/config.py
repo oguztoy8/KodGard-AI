@@ -5,7 +5,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 CHUNK_SIZE: int = 800
 CHUNK_OVERLAP: int = 100
-TOP_K_CHUNKS: int = 5
+TOP_K_CHUNKS: int = 8
 EMBEDDING_DIM: int = 384
 MAX_FILE_BYTES: int = 200 * 1024
 
